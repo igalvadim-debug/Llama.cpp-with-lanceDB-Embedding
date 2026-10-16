@@ -59,7 +59,7 @@ EXTRA_MODEL_DIRS = [
 
 
 def discover_models() -> dict[str, Path]:
-    """Sammelt alle .gguf-Chatmodelle aus Coder\models und den Zusatzordnern.
+    """Sammelt alle .gguf-Chatmodelle aus Coder/models und den Zusatzordnern.
 
     mmproj-*.gguf sind multimodale Projektor-Dateien (kein Chat-Modell) und
     werden ausgelassen. Nummerierung ist fortlaufend ab 1.
@@ -177,34 +177,50 @@ def port_is_open(port: int, host: str = "127.0.0.1") -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
-def find_pids_on_port(port: int) -> list[int]:
-    """Findet lauschende Prozesse per PowerShell, unabhängig von Windows-Sprache."""
+def find_pids_on_ports(ports: tuple[int, ...]) -> set[int]:
+    """Findet lauschende Prozesse ALLER Ports in EINEM PowerShell-Aufruf.
+
+    Ein einzelner Prozess-Start statt N Stueck spart mehrere Sekunden
+    (PowerShell-Kaltstart ist der teure Teil); unabhaengig von der Windows-Sprache.
+    """
+    pids: set[int] = set()
     try:
+        port_list = ",".join(str(p) for p in ports)
         result = subprocess.run(
             [
                 "powershell",
                 "-NoProfile",
                 "-Command",
-                f"(Get-NetTCPConnection -LocalPort {port} -State Listen "
+                f"(Get-NetTCPConnection -LocalPort {{{port_list}}} -State Listen "
                 f"-ErrorAction SilentlyContinue).OwningProcess",
             ],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=15,
         )
-        return [
-            int(line.strip())
-            for line in result.stdout.splitlines()
-            if line.strip().isdigit()
-        ]
+        for line in result.stdout.splitlines():
+            if line.strip().isdigit():
+                pids.add(int(line.strip()))
     except Exception:
-        return []
+        pass
+    return pids
 
 
 def kill_old_processes() -> None:
     print(f"Beende alte Prozesse auf den Ports {', '.join(map(str, PORTS))}...")
-    for port in PORTS:
-        for pid in find_pids_on_port(port):
+    pids = sorted(find_pids_on_ports(PORTS))
+    if not pids:
+        print("[OK] Keine alten Prozesse gefunden.")
+        print()
+        return
+    # taskkill kann mehrere /PID-Argumente in einem Aufruf verarbeiten
+    cmd = ["taskkill", "/F"]
+    for pid in pids:
+        cmd += ["/PID", str(pid)]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=15)
+    except Exception:
+        for pid in pids:
             try:
                 subprocess.run(
                     ["taskkill", "/PID", str(pid), "/F"],
@@ -278,6 +294,7 @@ def code_in_lancedb_indexieren() -> None:
 
     try:
         import hashlib
+        import json as _json
 
         import lancedb
         import pyarrow as pa
@@ -287,14 +304,32 @@ def code_in_lancedb_indexieren() -> None:
             print()
             return
 
+        # Datei-Mtime + Groesse als schneller Vorab-Cache: unveraenderte Dateien
+        # werden gar nicht erst gelesen und in Haeppchen zerlegt.
+        file_meta_path = LANCEDB_DB_PATH / "file_meta.json"
+        try:
+            old_meta = _json.loads(file_meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            old_meta = {}
+
         chunks = []
+        new_meta: dict[str, list] = {}
+        skipped_files = 0
         for root_dir, dirs, files in os.walk(str(PROJECT_DIR)):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
             for file in files:
                 if not file.endswith(".py"):
                     continue
                 file_path = Path(root_dir) / file
+                rel = str(file_path.relative_to(PROJECT_DIR))
                 try:
+                    st = file_path.stat()
+                    sig = [round(st.st_mtime, 6), st.st_size]
+                    if old_meta.get(rel) == sig:
+                        # Datei unveraendert -> alte Bloecke weiterverwenden
+                        skipped_files += 1
+                        continue
+                    new_meta[rel] = sig
                     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                         lines = f.readlines()
                     for i in range(0, len(lines), 30):
@@ -305,34 +340,42 @@ def code_in_lancedb_indexieren() -> None:
                             {
                                 "text": chunk_text,
                                 "filename": file,
-                                "rel_path": str(file_path.relative_to(PROJECT_DIR)),
+                                "rel_path": rel,
                                 "line_start": i + 1,
                             }
                         )
                 except Exception as e:
                     print(f"[WARN] Fehler beim Lesen von {file}: {e}")
 
-        if not chunks:
-            print("[WARN] Keine .py Dateien im Projektverzeichnis gefunden.")
-            print()
-            return
+        db = lancedb.connect(str(LANCEDB_DB_PATH))
 
         def chunk_key(c: dict) -> str:
             return hashlib.sha1((c["rel_path"] + "\n" + c["text"]).encode("utf-8")).hexdigest()
 
-        db = lancedb.connect(str(LANCEDB_DB_PATH))
         cache: dict[str, list[float]] = {}
+        kept_rows: list[dict] = []  # komplette Bloecke der unveraenderten Dateien
         if LANCEDB_TABLE in db.table_names():
             try:
+                changed = {c["rel_path"] for c in chunks}
                 for row in db.open_table(LANCEDB_TABLE).to_arrow().to_pylist():
                     cache[chunk_key(row)] = row["vector"]
+                    if row["rel_path"] not in changed:
+                        kept_rows.append(row)
             except Exception as e:
                 print(f"[WARN] Cache nicht lesbar, rechne alles neu: {e}")
                 cache = {}
+                kept_rows = []
+        if skipped_files:
+            print(f"[LanceDB] {skipped_files} unveraenderte .py-Dateien schnell uebersprungen (Mtime-Check)")
+
+        if not chunks and not kept_rows:
+            print("[WARN] Keine .py Dateien im Projektverzeichnis gefunden.")
+            print()
+            return
 
         keys = [chunk_key(c) for c in chunks]
         todo = [i for i, k in enumerate(keys) if k not in cache]
-        print(f"[LanceDB] {len(chunks)} Code-Bloecke, {len(chunks) - len(todo)} aus Cache, "
+        print(f"[LanceDB] {len(chunks)} geaenderte/neue Code-Bloecke, {len(chunks) - len(todo)} aus Cache, "
               f"{len(todo)} neu zu berechnen")
 
         batch = 8
@@ -342,13 +385,19 @@ def code_in_lancedb_indexieren() -> None:
                 f"title: {chunks[i]['filename']} | text: {chunks[i]['text'][:4000]}"
                 for i in idxs
             ]
-            for i, vec in zip(idxs, embed_texts(texts)):
+            vectors = embed_texts(texts)
+            for i, vec in zip(idxs, vectors):
                 cache[keys[i]] = vec
             done = min(start + batch, len(todo))
             if (start // batch) % 5 == 0 or done == len(todo):
                 print(f"[LanceDB]   {done}/{len(todo)} berechnet", flush=True)
 
-        dim = len(cache[keys[0]])
+        first_vec = cache[keys[0]] if keys else (kept_rows[0]["vector"] if kept_rows else None)
+        if first_vec is None:
+            print("[WARN] Keine Vektoren verfuegbar - Tabelle bleibt unveraendert.")
+            print()
+            return
+        dim = len(first_vec)
         schema = pa.schema(
             [
                 pa.field("text", pa.string()),
@@ -358,10 +407,20 @@ def code_in_lancedb_indexieren() -> None:
                 pa.field("line_start", pa.int32()),
             ]
         )
-        rows = [dict(c, vector=cache[k]) for c, k in zip(chunks, keys)]
+        rows = kept_rows + [dict(c, vector=cache[k]) for c, k in zip(chunks, keys)]
         db.create_table(
             LANCEDB_TABLE, data=pa.Table.from_pylist(rows, schema=schema), mode="overwrite"
         )
+        # Mtime-Metadaten fuer den naechsten Lauf speichern
+        try:
+            all_meta = {r["rel_path"]: new_meta.get(r["rel_path"], old_meta.get(r["rel_path"]))
+                        for r in kept_rows}
+            all_meta.update(new_meta)
+            all_meta = {k: v for k, v in all_meta.items() if v is not None}
+            LANCEDB_DB_PATH.mkdir(parents=True, exist_ok=True)
+            file_meta_path.write_text(_json.dumps(all_meta), encoding="utf-8")
+        except Exception as e:
+            print(f"[WARN] Konnte file_meta.json nicht schreiben: {e}")
         print(f"[OK] {len(rows)} Code-Bloecke in '{LANCEDB_TABLE}' indexiert ({dim} Dimensionen)")
         print(f"     DB-Pfad: {LANCEDB_DB_PATH}")
     except Exception as e:
@@ -371,11 +430,49 @@ def code_in_lancedb_indexieren() -> None:
     print()
 
 def wait_for_port(port: int, max_tries: int = 40) -> bool:
+    """Wartet auf einen offenen Port; Poll-Intervall steigt von 0.25s bis 1s an.
+
+    So sind schnell startende Server sofort erkannt, ohne dass bei langsamen
+    Servern unnaetig viel abgefragt wird.
+    """
+    delay = 0.25
     for _ in range(max_tries):
         if port_is_open(port):
             return True
-        time.sleep(1)
+        time.sleep(delay)
+        if delay < 1.0:
+            delay = min(1.0, delay * 2)
     return False
+
+
+def wait_for_ports_parallel(ports: dict[int, str], max_tries: int = 40) -> None:
+    """Ueberwacht mehrere Ports gleichzeitig in eigenen Threads.
+
+    Die MCP-Server starten parallel in ihren WT-Tabs - sequentielles Warten
+    addiert die Wartezeiten. Mit Threads ist die Gesamtzeit maximal so lang
+    wie der langsamste Dienst.
+    """
+    import threading
+
+    lock = threading.Lock()
+
+    def _wait_one(port: int, name: str) -> None:
+        ok = wait_for_port(port, max_tries=max_tries)
+        with lock:
+            if ok:
+                print(f"[OK] {name} auf Port {port}")
+            else:
+                print(f"[WARN] {name} (Port {port}) noch nicht erreichbar - "
+                      f"bitte den passenden Tab pruefen.")
+
+    threads = [
+        threading.Thread(target=_wait_one, args=(port, name), daemon=True)
+        for port, name in ports.items()
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
 
 def write_helper_bat(command: str, cwd: Path, title: str, helper_name: str) -> Path:
@@ -470,16 +567,15 @@ def main() -> None:
     )
     print()
 
-    print("Warte auf Filesystem MCP (8001), RepoMapper MCP (8002), LanceDB MCP (8003)...")
-    for port, name in ((8001, "Filesystem MCP"), (8002, "RepoMapper MCP"), (8003, "LanceDB MCP")):
-        if not wait_for_port(port):
-            print(f"[WARN] {name} (Port {port}) noch nicht erreichbar - bitte den passenden Tab pruefen.")
-        else:
-            print(f"[OK] {name} auf Port {port}")
+    print("Warte parallel auf Filesystem MCP (8001), RepoMapper MCP (8002), LanceDB MCP (8003)...")
+    wait_for_ports_parallel(
+        {8001: "Filesystem MCP", 8002: "RepoMapper MCP", 8003: "LanceDB MCP"},
+        max_tries=40,
+    )
     print()
 
     print("Warte auf llama-server (8484) - Modell wird geladen, kann dauern...")
-    if wait_for_port(8484, max_tries=120):
+    if wait_for_port(8484, max_tries=180):
         print("[OK] llama-server auf Port 8484")
     else:
         print("[WARN] llama-server (Port 8484) noch nicht erreichbar - bitte den llama-server-Tab pruefen.")

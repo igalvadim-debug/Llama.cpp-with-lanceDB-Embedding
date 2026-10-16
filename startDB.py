@@ -121,7 +121,7 @@ def find_pids_on_ports(ports: tuple[int, ...]) -> set[int]:
                 "powershell",
                 "-NoProfile",
                 "-Command",
-                f"(Get-NetTCPConnection -LocalPort {{{port_list}}} -State Listen "
+                f"(Get-NetTCPConnection -LocalPort @({port_list}) -State Listen "
                 f"-ErrorAction SilentlyContinue).OwningProcess",
             ],
             capture_output=True,
@@ -148,8 +148,10 @@ def kill_old_processes() -> None:
     for pid in pids:
         cmd += ["/PID", str(pid)]
     try:
-        subprocess.run(cmd, capture_output=True, timeout=15)
+        subprocess.check_call(cmd, capture_output=True, timeout=15)
     except Exception:
+        # Fallback: einzeln beenden, falls der Sammel-Aufruf fehlschlaegt
+        # (check_call wirft auch bei nonzero Exit-Code -> PID-Fallback laeuft)
         for pid in pids:
             try:
                 subprocess.run(

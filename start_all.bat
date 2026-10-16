@@ -20,18 +20,21 @@ rem    start_all.bat 4 hermes             -> Modell 4, nur Hermes
 rem    start_all.bat 5 none               -> Modell 5, ohne Agenten
 rem ============================================================
 
-set "CODER=D:\claudeAgent\Coder"
+rem --- Basispfad aus dem tatsächlichen Skriptpfad ableiten ---
+set "CODER=%~dp0"
+if "%CODER:~-1%"=="\" set "CODER=%CODER:~0,-1%"
+
 set "PYTHON=%CODER%\RepoMapper\venv\Scripts\python.exe"
 if not exist "%PYTHON%" set "PYTHON=python"
 
 rem --- Pfade der Agenten (bei Bedarf an eigene Installation anpassen) ---
 rem Claude Code:
-if not defined CLAUDE_CMD   set "CLAUDE_CMD=C:\Users\Startklar\.local\bin\claude.exe"
-rem Hermes Agent (hermes-agent): Pfad zur hermes.exe ODER Name im PATH:
+if not defined CLAUDE_CMD   set "CLAUDE_CMD=%USERPROFILE%\.local\bin\claude.exe"
+rem Hermes Agent (hermes-agent): Name im PATH (einfach "hermes" aufrufen) ODER voller Pfad zur exe:
 if not defined HERMES_CMD   set "HERMES_CMD=hermes"
 rem opencode liegt normal im PATH - nichts zu setzen.
 rem Eigene Claude-Konfiguration (MCP/MCP-URLs etc.):
-if not defined CLAUDE_CONFIG_DIR set "CLAUDE_CONFIG_DIR=D:\claudeAgent\claude-local"
+if not defined CLAUDE_CONFIG_DIR set "CLAUDE_CONFIG_DIR=%CODER%\..\claude-local"
 
 if not exist "%CODER%\start.py" (
     echo [FEHLER] %CODER%\start.py nicht gefunden.
@@ -48,7 +51,7 @@ echo.
 
 rem --- Modell auswaehlen (Parameter 1 oder interaktiv) ---
 set "MODEL=%~1"
-if "%MODEL%"=="" (
+if not defined MODEL (
     echo Modelle:
     echo   [1] Qwen2.5-Coder-7B-Instruct-Q4_K_M
     echo   [2] Qwopus3.5-4B-Coder-MTP-Q8_0
@@ -58,15 +61,24 @@ if "%MODEL%"=="" (
     echo   [6] Qwopus-MoE-35B-A3B-APEX-I-Mini
     echo   [7] Qwen3.6-35B-A3B-abliterated.IQ4_XS
     set /p "MODEL=Modellnummer (1-7, Enter = 1): "
-    if "%MODEL%"=="" set "MODEL=1"
+    if not defined MODEL set "MODEL=1"
+)
+
+rem --- Modell gegen die unterstuetzten Nummern (1-7) validieren ---
+set "MODEL_OK="
+for %%m in (1 2 3 4 5 6 7) do if "%MODEL%"=="%%m" set "MODEL_OK=1"
+if not defined MODEL_OK (
+    echo [FEHLER] Ungueltige Modellnummer: "%MODEL%" - erlaubt sind 1-7.
+    pause
+    exit /b 1
 )
 
 rem --- Agenten auswaehlen (Parameter 2 oder interaktiv) ---
 set "AGENTS=%~2"
-if "%AGENTS%"=="" (
+if not defined AGENTS (
     echo.
     echo Agenten-Tabs:
-    echo   [a] alle drei: claude,opencode,hermes   (Standard)
+    echo   [a] alle drei: claude,opencode,hermes   ^(Standard^)
     echo   [c] nur Claude Code
     echo   [o] nur opencode
     echo   [h] nur Hermes Agent
@@ -78,18 +90,34 @@ if "%AGENTS%"=="" (
     if "%WAHL%"=="o" set "AGENTS=opencode"
     if "%WAHL%"=="h" set "AGENTS=hermes"
     if "%WAHL%"=="n" set "AGENTS=none"
-    if "%AGENTS%"=="" set "AGENTS=claude,opencode,hermes"
+    if not defined AGENTS set "AGENTS=claude,opencode,hermes"
 )
 if /i "%AGENTS%"=="all" set "AGENTS=claude,opencode,hermes"
 
-rem --- opencode: lokale Konfiguration (API 8484 + MCP 8001/8002/8003) anlegen ---
-if not exist "%USERPROFILE%\.config\opencode" mkdir "%USERPROFILE%\.config\opencode"
-copy /y "%CODER%\opencode.json" "%USERPROFILE%\.config\opencode\opencode.json" >nul 2>&1
+rem --- opencode: lokale Konfiguration (API 8484 + MCP 8001/8002/8003) ---
+rem Bestehende Benutzerkonfiguration NIEMALS einfach ueberschreiben: nur
+rem installieren, wenn noch keine existiert - sonst explizit nachfragen.
+set "OC_USERCFG=%USERPROFILE%\.config\opencode\opencode.json"
+if exist "%OC_USERCFG%" (
+    echo.
+    echo [INFO] Eigene opencode-Konfiguration vorhanden: %OC_USERCFG%
+    choice /c jn /n /m "Ersetzen und mitgelieferte Konfiguration installieren? (j/N): " /t 30 /d n
+    if errorlevel 2 (
+        echo [INFO] Bestehende Konfiguration bleibt unveraendert.
+    ) else (
+        copy /y "%CODER%\opencode.json" "%OC_USERCFG%" >nul 2>&1
+        echo [OK] opencode-Konfiguration aktualisiert.
+    )
+) else (
+    if not exist "%USERPROFILE%\.config\opencode" mkdir "%USERPROFILE%\.config\opencode"
+    copy /y "%CODER%\opencode.json" "%OC_USERCFG%" >nul 2>&1
+    echo [OK] opencode-Konfiguration installiert: %OC_USERCFG%
+)
 
 echo.
 echo [START] Modell %MODEL%, Agenten: %AGENTS%
 echo         (Embedding-Server 8512, Index-Pruefung, dann Windows-Terminal-Fenster)
-"%PYTHON%" "%CODER%\start.py" %MODEL% %AGENTS%
+"%PYTHON%" "%CODER%\start.py" "%MODEL%" %AGENTS%
 if errorlevel 1 (
     echo.
     echo [FEHLER] start.py ist fehlgeschlagen - bitte Ausgabe oben pruefen.

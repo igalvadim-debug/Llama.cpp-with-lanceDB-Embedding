@@ -16,11 +16,12 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path(r"D:\claudeAgent\Coder")
+# ROOT folgt dem tatsächlichen Checkout-Pfad des Skripts
+ROOT = Path(__file__).resolve().parent
 SERVER_EXE = Path(r"D:\Unsloth\C-claude\llama.cpp\llama-server.exe")
 # embeddinggemma braucht ein neueres llama.cpp (Architektur gemma-embedding2) -> eigener CPU-Build
 EMBED_EXE = Path(r"D:\Unsloth\C-claude\llama.cpp_embed\llama-server.exe")
-EMBED_MODEL = Path(r"D:\claudeAgent\Coder\models\embeddinggemma-2-Q8_0\embeddinggemma-2-Q8_0.gguf")
+EMBED_MODEL = ROOT / "models" / "embeddinggemma-2-Q8_0" / "embeddinggemma-2-Q8_0.gguf"
 EMBED_PORT = 8512
 EMBED_URL = f"http://127.0.0.1:{EMBED_PORT}/v1/embeddings"
 LANCEDB_TABLE = "project_code_gemma"
@@ -152,7 +153,7 @@ def find_pids_on_ports(ports: tuple[int, ...]) -> set[int]:
                 "powershell",
                 "-NoProfile",
                 "-Command",
-                f"(Get-NetTCPConnection -LocalPort {{{port_list}}} -State Listen "
+                f"(Get-NetTCPConnection -LocalPort @({port_list}) -State Listen "
                 f"-ErrorAction SilentlyContinue).OwningProcess",
             ],
             capture_output=True,
@@ -180,9 +181,10 @@ def kill_old_processes() -> None:
     for pid in pids:
         cmd += ["/PID", str(pid)]
     try:
-        subprocess.run(cmd, capture_output=True, timeout=15)
+        subprocess.check_call(cmd, capture_output=True, timeout=15)
     except Exception:
         # Fallback: einzeln beenden, falls der Sammel-Aufruf fehlschlaegt
+        # (check_call wirft auch bei nonzero Exit-Code -> PID-Fallback laeuft)
         for pid in pids:
             try:
                 subprocess.run(
@@ -267,7 +269,10 @@ def code_in_lancedb_indexieren() -> None:
             return
 
         # Datei-Mtime + Groesse als schneller Vorab-Cache: unveraenderte Dateien
-        # werden gar nicht erst gelesen und in Haeppchen zerlegt.
+        # werden gar nicht erst gelesen und in Haeppchen zerlegt. Die Tabelle wird
+        # dafuer VOR dem Datei-Scan gelesen: Mtime-Signaturen gelten nur, wenn die
+        # zugehoerigen Zeilen auch wirklich in der Tabelle vorhanden und lesbar sind
+        # (sonst wuerden geloeschte/fehlende Dateien für immer aus dem Index fehlen).
         file_meta_path = LANCEDB_DB_PATH / "file_meta.json"
         try:
             import json as _json
@@ -276,8 +281,28 @@ def code_in_lancedb_indexieren() -> None:
         except Exception:
             old_meta = {}
 
+        db = lancedb.connect(str(LANCEDB_DB_PATH))
+
+        def chunk_key(c: dict) -> str:
+            return hashlib.sha1((c["rel_path"] + "\n" + c["text"]).encode("utf-8")).hexdigest()
+
+        cache: dict[str, list[float]] = {}
+        table_rows: list[dict] = []
+        if LANCEDB_TABLE in db.table_names():
+            try:
+                table_rows = db.open_table(LANCEDB_TABLE).to_arrow().to_pylist()
+            except Exception as e:
+                print(f"[WARN] Cache nicht lesbar, rechne alles neu: {e}")
+                table_rows = []
+        for row in table_rows:
+            cache[chunk_key(row)] = row["vector"]
+        indexed_paths = {row["rel_path"] for row in table_rows}
+        # Mtime-Skip nur fuer Dateien, deren Bloecke tatsaechlich in der Tabelle stecken
+        old_meta = {k: v for k, v in old_meta.items() if k in indexed_paths}
+
         chunks = []
         new_meta: dict[str, list] = {}
+        unchanged_files: set[str] = set()
         skipped_files = 0
         for root_dir, dirs, files in os.walk(str(PROJECT_DIR)):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
@@ -291,6 +316,7 @@ def code_in_lancedb_indexieren() -> None:
                     sig = [round(st.st_mtime, 6), st.st_size]
                     if old_meta.get(rel) == sig:
                         # Datei unveraendert -> alte Bloecke weiterverwenden
+                        unchanged_files.add(rel)
                         skipped_files += 1
                         continue
                     new_meta[rel] = sig
@@ -311,24 +337,10 @@ def code_in_lancedb_indexieren() -> None:
                 except Exception as e:
                     print(f"[WARN] Fehler beim Lesen von {file}: {e}")
 
-        db = lancedb.connect(str(LANCEDB_DB_PATH))
-
-        def chunk_key(c: dict) -> str:
-            return hashlib.sha1((c["rel_path"] + "\n" + c["text"]).encode("utf-8")).hexdigest()
-
-        cache: dict[str, list[float]] = {}
-        kept_rows: list[dict] = []  # komplette Bloecke der unveraenderten Dateien
-        if LANCEDB_TABLE in db.table_names():
-            try:
-                changed = {c["rel_path"] for c in chunks}
-                for row in db.open_table(LANCEDB_TABLE).to_arrow().to_pylist():
-                    cache[chunk_key(row)] = row["vector"]
-                    if row["rel_path"] not in changed:
-                        kept_rows.append(row)
-            except Exception as e:
-                print(f"[WARN] Cache nicht lesbar, rechne alles neu: {e}")
-                cache = {}
-                kept_rows = []
+        chunk_paths = {c["rel_path"] for c in chunks}
+        kept_rows = [row for row in table_rows
+                     if row["rel_path"] in unchanged_files
+                     and row["rel_path"] not in chunk_paths]  # Bloecke der unveraenderten Dateien
         if skipped_files:
             print(f"[LanceDB] {skipped_files} unveraenderte .py-Dateien schnell uebersprungen (Mtime-Check)")
 
@@ -375,12 +387,11 @@ def code_in_lancedb_indexieren() -> None:
         db.create_table(
             LANCEDB_TABLE, data=pa.Table.from_pylist(rows, schema=schema), mode="overwrite"
         )
-        # Mtime-Metadaten fuer den naechsten Lauf speichern
+        # Mtime-Metadaten fuer den naechsten Lauf speichern (nur Dateien, die in
+        # diesem Lauf gelesen wurden oder deren Bloecke erhalten blieben)
         try:
-            all_meta = {r["rel_path"]: new_meta.get(r["rel_path"], old_meta.get(r["rel_path"]))
-                        for r in kept_rows}
+            all_meta = {k: v for k, v in old_meta.items() if k in unchanged_files}
             all_meta.update(new_meta)
-            all_meta = {k: v for k, v in all_meta.items() if v is not None}
             LANCEDB_DB_PATH.mkdir(parents=True, exist_ok=True)
             file_meta_path.write_text(_json.dumps(all_meta), encoding="utf-8")
         except Exception as e:
@@ -503,14 +514,13 @@ def agent_cmd_for(kind: str, base_cmd: str) -> str | None:
         helper = write_claude_local_bat()
         return f'set "CLAUDE_CONFIG_DIR={CLAUDE_CONFIG_DIR}" && "{helper}"'
     if kind == "hermes":
-        hermes = Path(os.environ.get("HERMES_CMD", HERMES_DEFAULT))
-        if hermes.exists():
-            return f'"{hermes}"'
-        return "hermes"
-    # opencode: nutzt ~/.config/opencode/opencode.json (siehe start_all.bat)
-    cfg = ROOT / "opencode.json"
-    if cfg.exists():
-        return f'set "OPENCODE_CONFIG={cfg}" && {base_cmd}'
+        # HERMES_DEFAULT enthaelt den Wert aus HERMES_CMD (Modul-Init) - nicht
+        # erneut einlesen; bare Befehlsnamen (laufen ueber PATH) unverändert lassen.
+        if Path(HERMES_DEFAULT).exists():
+            return f'"{HERMES_DEFAULT}"'
+        return HERMES_DEFAULT
+    # opencode: nutzt ~/.config/opencode/opencode.json (siehe start_all.bat);
+    # keine projektlokale Config erzwingen - vorhandene Benutzerkonfiguration bleibt aktiv.
     return base_cmd
 
 

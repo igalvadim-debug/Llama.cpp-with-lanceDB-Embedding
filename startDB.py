@@ -27,7 +27,8 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Pfade anpassen falls nötig
 # ---------------------------------------------------------------------------
-ROOT = Path(r"D:\claudeAgent\Coder")
+# ROOT folgt dem tatsächlichen Checkout-Pfad des Skripts
+ROOT = Path(__file__).resolve().parent
 SERVER_EXE = Path(r"D:\Unsloth\C-claude\llama.cpp\llama-server.exe")
 PROJECT_DIR = ROOT / "projects" / "QwenProject"
 REPOMAPPER_DIR = ROOT / "RepoMapper"
@@ -148,10 +149,10 @@ def kill_old_processes() -> None:
     for pid in pids:
         cmd += ["/PID", str(pid)]
     try:
-        subprocess.check_call(cmd, capture_output=True, timeout=15)
+        subprocess.run(cmd, capture_output=True, timeout=15, check=True)
     except Exception:
         # Fallback: einzeln beenden, falls der Sammel-Aufruf fehlschlaegt
-        # (check_call wirft auch bei nonzero Exit-Code -> PID-Fallback laeuft)
+        # (check=True wirft auch bei nonzero Exit-Code -> PID-Fallback laeuft)
         for pid in pids:
             try:
                 subprocess.run(

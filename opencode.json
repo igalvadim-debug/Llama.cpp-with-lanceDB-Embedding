@@ -1,0 +1,32 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "llama.cpp": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "llama.cpp (lokal, Port 8484)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8484/v1"
+      },
+      "models": {
+        "local-model": {
+          "name": "Lokales Modell (in start_all.bat waehlen)"
+        }
+      }
+    }
+  },
+  "model": "llama.cpp/local-model",
+  "mcp": {
+    "filesystem": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8001/mcp"
+    },
+    "repomapper": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8002/mcp"
+    },
+    "lancedb": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8003/mcp"
+    }
+  }
+}

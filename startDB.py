@@ -27,7 +27,8 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Pfade anpassen falls nötig
 # ---------------------------------------------------------------------------
-ROOT = Path(r"D:\claudeAgent\Coder")
+# ROOT folgt dem tatsächlichen Checkout-Pfad des Skripts
+ROOT = Path(__file__).resolve().parent
 SERVER_EXE = Path(r"D:\Unsloth\C-claude\llama.cpp\llama-server.exe")
 PROJECT_DIR = ROOT / "projects" / "QwenProject"
 REPOMAPPER_DIR = ROOT / "RepoMapper"
@@ -107,34 +108,52 @@ def port_is_open(port: int, host: str = "127.0.0.1") -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
-def find_pids_on_port(port: int) -> list[int]:
-    """Findet lauschende Prozesse per PowerShell, unabhängig von Windows-Sprache."""
+def find_pids_on_ports(ports: tuple[int, ...]) -> set[int]:
+    """Findet lauschende Prozesse ALLER Ports in EINEM PowerShell-Aufruf.
+
+    Ein einzelner Prozess-Start statt N Stueck spart mehrere Sekunden
+    (PowerShell-Kaltstart ist der teure Teil); unabhaengig von der Windows-Sprache.
+    """
+    pids: set[int] = set()
     try:
+        port_list = ",".join(str(p) for p in ports)
         result = subprocess.run(
             [
                 "powershell",
                 "-NoProfile",
                 "-Command",
-                f"(Get-NetTCPConnection -LocalPort {port} -State Listen "
+                f"(Get-NetTCPConnection -LocalPort @({port_list}) -State Listen "
                 f"-ErrorAction SilentlyContinue).OwningProcess",
             ],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=15,
         )
-        return [
-            int(line.strip())
-            for line in result.stdout.splitlines()
-            if line.strip().isdigit()
-        ]
+        for line in result.stdout.splitlines():
+            if line.strip().isdigit():
+                pids.add(int(line.strip()))
     except Exception:
-        return []
+        pass
+    return pids
 
 
 def kill_old_processes() -> None:
     print(f"Beende alte Prozesse auf den Ports {', '.join(map(str, PORTS))}...")
-    for port in PORTS:
-        for pid in find_pids_on_port(port):
+    pids = sorted(find_pids_on_ports(PORTS))
+    if not pids:
+        print("[OK] Keine alten Prozesse gefunden.")
+        print()
+        return
+    # taskkill kann mehrere /PID-Argumente in einem Aufruf verarbeiten
+    cmd = ["taskkill", "/F"]
+    for pid in pids:
+        cmd += ["/PID", str(pid)]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=15, check=True)
+    except Exception:
+        # Fallback: einzeln beenden, falls der Sammel-Aufruf fehlschlaegt
+        # (check=True wirft auch bei nonzero Exit-Code -> PID-Fallback laeuft)
+        for pid in pids:
             try:
                 subprocess.run(
                     ["taskkill", "/PID", str(pid), "/F"],
@@ -214,11 +233,49 @@ def code_in_lancedb_indexieren() -> None:
 
 
 def wait_for_port(port: int, max_tries: int = 40) -> bool:
+    """Wartet auf einen offenen Port; Poll-Intervall steigt von 0.25s bis 1s an.
+
+    So sind schnell startende Server sofort erkannt, ohne dass bei langsamen
+    Servern unnaetig viel abgefragt wird.
+    """
+    delay = 0.25
     for _ in range(max_tries):
         if port_is_open(port):
             return True
-        time.sleep(1)
+        time.sleep(delay)
+        if delay < 1.0:
+            delay = min(1.0, delay * 2)
     return False
+
+
+def wait_for_ports_parallel(ports: dict[int, str], max_tries: int = 40) -> None:
+    """Ueberwacht mehrere Ports gleichzeitig in eigenen Threads.
+
+    Die MCP-Server starten parallel in ihren WT-Tabs - sequentielles Warten
+    addiert die Wartezeiten. Mit Threads ist die Gesamtzeit maximal so lang
+    wie der langsamste Dienst.
+    """
+    import threading
+
+    lock = threading.Lock()
+
+    def _wait_one(port: int, name: str) -> None:
+        ok = wait_for_port(port, max_tries=max_tries)
+        with lock:
+            if ok:
+                print(f"[OK] {name} auf Port {port}")
+            else:
+                print(f"[WARN] {name} (Port {port}) noch nicht erreichbar - "
+                      f"bitte den passenden Tab pruefen.")
+
+    threads = [
+        threading.Thread(target=_wait_one, args=(port, name), daemon=True)
+        for port, name in ports.items()
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
 
 def write_helper_bat(command: str, cwd: Path, title: str, helper_name: str) -> Path:
@@ -313,16 +370,15 @@ def main() -> None:
     )
     print()
 
-    print("Warte auf Filesystem MCP (8001), RepoMapper MCP (8002), LanceDB MCP (8003)...")
-    for port, name in ((8001, "Filesystem MCP"), (8002, "RepoMapper MCP"), (8003, "LanceDB MCP")):
-        if not wait_for_port(port):
-            print(f"[WARN] {name} (Port {port}) noch nicht erreichbar - bitte den passenden Tab pruefen.")
-        else:
-            print(f"[OK] {name} auf Port {port}")
+    print("Warte parallel auf Filesystem MCP (8001), RepoMapper MCP (8002), LanceDB MCP (8003)...")
+    wait_for_ports_parallel(
+        {8001: "Filesystem MCP", 8002: "RepoMapper MCP", 8003: "LanceDB MCP"},
+        max_tries=40,
+    )
     print()
 
     print("Warte auf llama-server (8484) - Modell wird geladen, kann dauern...")
-    if wait_for_port(8484, max_tries=120):
+    if wait_for_port(8484, max_tries=180):
         print("[OK] llama-server auf Port 8484")
     else:
         print("[WARN] llama-server (Port 8484) noch nicht erreichbar - bitte den llama-server-Tab pruefen.")

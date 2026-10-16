@@ -85,6 +85,8 @@ if not defined AGENTS (
     echo   [n] keine Agenten
     set "WAHL="
     set /p "WAHL=Auswahl (a/c/o/h/n, Enter = a): "
+)
+if not defined AGENTS (
     if "%WAHL%"=="a" set "AGENTS=claude,opencode,hermes"
     if "%WAHL%"=="c" set "AGENTS=claude"
     if "%WAHL%"=="o" set "AGENTS=opencode"

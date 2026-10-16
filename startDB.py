@@ -148,8 +148,10 @@ def kill_old_processes() -> None:
     for pid in pids:
         cmd += ["/PID", str(pid)]
     try:
-        subprocess.run(cmd, capture_output=True, timeout=15)
+        subprocess.check_call(cmd, capture_output=True, timeout=15)
     except Exception:
+        # Fallback: einzeln beenden, falls der Sammel-Aufruf fehlschlaegt
+        # (check_call wirft auch bei nonzero Exit-Code -> PID-Fallback laeuft)
         for pid in pids:
             try:
                 subprocess.run(

@@ -37,6 +37,11 @@ VENV_PYTHON = REPOMAPPER_DIR / "venv" / "Scripts" / "python.exe"
 HELPER_DIR = ROOT / "_start_helpers"
 WT_EXE = Path(os.environ["LOCALAPPDATA"]) / "Microsoft" / "WindowsApps" / "wt.exe"
 
+# Agenten (Claude Code / opencode / Hermes) - Pfade per Umgebungsvariablen ueberschreibbar
+CLAUDE_EXE = Path(os.environ.get("CLAUDE_CMD", r"C:\Users\Startklar\.local\bin\claude.exe"))
+CLAUDE_CONFIG_DIR = os.environ.get("CLAUDE_CONFIG_DIR", str(ROOT.parent / "claude-local"))
+HERMES_DEFAULT = os.environ.get("HERMES_CMD", "hermes")
+
 MODELS = {
     "1": ROOT / "models" / "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
     "2": ROOT / "models" / "Qwopus3.5-4B-Coder-MTP-Q8_0.gguf",
@@ -487,11 +492,84 @@ def ensure_venv_runtime() -> None:
     raise SystemExit(result.returncode)
 
 
+def agent_cmd_for(kind: str, base_cmd: str) -> str | None:
+    """Baut den Startbefehl fuer einen Agenten-Tab (claude / opencode / hermes).
+
+    Fuer claude wird zusaetzlich ein lokaler llama.cpp-Helfer geschrieben, damit
+    Claude Code gegen Port 8484 laeuft (ANTHROPIC_BASE_URL -> http://127.0.0.1:8484,
+    Anthropic-kompatible /v1/messages von llama-server).
+    """
+    if kind == "claude":
+        helper = write_claude_local_bat()
+        return f'set "CLAUDE_CONFIG_DIR={CLAUDE_CONFIG_DIR}" && "{helper}"'
+    if kind == "hermes":
+        hermes = Path(os.environ.get("HERMES_CMD", HERMES_DEFAULT))
+        if hermes.exists():
+            return f'"{hermes}"'
+        return "hermes"
+    # opencode: nutzt ~/.config/opencode/opencode.json (siehe start_all.bat)
+    cfg = ROOT / "opencode.json"
+    if cfg.exists():
+        return f'set "OPENCODE_CONFIG={cfg}" && {base_cmd}'
+    return base_cmd
+
+
+def write_claude_local_bat() -> Path:
+    """Schreibt _start_helpers\\claude_local.bat mit lokaler API-Config."""
+    HELPER_DIR.mkdir(parents=True, exist_ok=True)
+    helper = HELPER_DIR / "claude_local.bat"
+    lines = [
+        "@echo off",
+        'set "ANTHROPIC_BASE_URL=http://127.0.0.1:8484"',
+        'set "ANTHROPIC_API_KEY=not-needed"',
+        'set "API_TIMEOUT_MS=3000000"',
+        'set "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"',
+        f'"{CLAUDE_EXE}" %*',
+        "",
+    ]
+    helper.write_text("\r\n".join(lines), encoding="utf-8")
+    return helper
+
+
+AGENT_TABS = {
+    "claude":   ("Claude Code",     "claude"),
+    "opencode": ("opencode",        "opencode"),
+    "hermes":   ("Hermes Agent",    "hermes"),
+}
+
+
+def choose_agents(arg_agents: str | None) -> list[str]:
+    """Agenten-Tabs aus Argument ('claude,opencode,hermes') oder interaktiv waehlen."""
+    known = tuple(AGENT_TABS)
+    default = list(known)
+    if arg_agents is not None:
+        kinds = [a.strip().lower() for a in arg_agents.split(",") if a.strip()]
+        if not kinds or kinds[0] in ("none", "n", "keine"):
+            return []
+        if kinds[0] == "all":
+            return default
+        bad = [k for k in kinds if k not in known]
+        if bad:
+            print(f"[WARN] Unbekannte Agenten uebersprungen: {', '.join(bad)} "
+                  f"(erlaubt: {', '.join(known)})")
+        return [k for k in kinds if k in known]
+    print()
+    print("Agenten-Tabs: [a] alle drei (claude+opencode+hermes, Standard), "
+          "[c] Claude, [o] opencode, [h] Hermes, [n] keine")
+    wahl = input("Auswahl (Enter = a): ").strip().lower()
+    return {
+        "": default, "a": default, "c": ["claude"],
+        "o": ["opencode"], "h": ["hermes"], "n": [],
+    }.get(wahl, default)
+
+
 def main() -> None:
     ensure_venv_runtime()
     banner()
     arg_choice = sys.argv[1] if len(sys.argv) > 1 else None
+    arg_agents = sys.argv[2] if len(sys.argv) > 2 else None
     model_path = choose_model(arg_choice)
+    agent_kinds = choose_agents(arg_agents)
     check_prerequisites(model_path)
     kill_old_processes()
 
@@ -539,16 +617,25 @@ def main() -> None:
         llama_cmd, cwd=ROOT, title="llama-server 8484", helper_name="llama"
     )
 
-    print("Oeffne EIN Windows-Terminal-Fenster mit 4 Tabs "
-          "(Filesystem, RepoMapper, LanceDB, llama-server)...")
-    open_wt_tabs(
-        [
-            ("MCP Filesystem 8001", fs_bat),
-            ("MCP RepoMapper 8002", repomapper_bat),
-            ("MCP LanceDB 8003", lancedb_bat),
-            ("llama-server 8484", llama_bat),
-        ]
-    )
+    print("Oeffne EIN Windows-Terminal-Fenster mit Tabs "
+          "(Filesystem, RepoMapper, LanceDB, llama-server + Agenten)...")
+    tab_defs = [
+        ("MCP Filesystem 8001", fs_bat),
+        ("MCP RepoMapper 8002", repomapper_bat),
+        ("MCP LanceDB 8003", lancedb_bat),
+        ("llama-server 8484", llama_bat),
+    ]
+    for kind in agent_kinds:
+        info = AGENT_TABS.get(kind)
+        if not info:
+            print(f"[WARN] Unbekannter Agent '{kind}' - uebersprungen "
+                  f"(erlaubt: claude, opencode, hermes)")
+            continue
+        title, base_cmd = info
+        cmd = agent_cmd_for(kind, base_cmd)
+        bat = write_helper_bat(cmd, cwd=PROJECT_DIR, title=title, helper_name=f"agent_{kind}")
+        tab_defs.append((title, bat))
+    open_wt_tabs(tab_defs)
     print()
 
     print("Warte parallel auf Filesystem MCP (8001), RepoMapper MCP (8002), LanceDB MCP (8003)...")
@@ -575,7 +662,12 @@ def main() -> None:
     print("LanceDB   : http://127.0.0.1:8003/mcp")
     print("Embedding : http://127.0.0.1:8512/v1/embeddings (embeddinggemma)")
     print()
-    print("Alle 4 Dienste laufen als Tabs im selben Windows-Terminal-Fenster.")
+    print("Alle Dienste laufen als Tabs im selben Windows-Terminal-Fenster.")
+    if agent_kinds:
+        print("Agenten-Tabs (claude/opencode/hermes) sind geoeffnet - "
+              "einfach in den jeweiligen Tab wechseln.")
+    else:
+        print("Keine Agenten-Tabs - Starte mit z.B.:  start_all.bat 1 claude,opencode,hermes")
     print("Dieses Startfenster kann jetzt geschlossen werden.")
     print("==========================================================")
     if arg_choice is None:
